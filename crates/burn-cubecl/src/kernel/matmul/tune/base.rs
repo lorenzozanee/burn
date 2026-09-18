@@ -39,6 +39,8 @@ use cubek::matmul::{
 
 pub(super) type Inputs = (CubeTensor, CubeTensor, CubeTensor);
 
+const ASYNC_COPY_STRIDE_FACTOR: u8 = 4;
+
 /// Whether the device can run `tile_matmul` with the element types of the matmul `definition`.
 ///
 /// The kernel runs on the *register* types, not the global ones: the selection paths promote
@@ -98,7 +100,6 @@ pub fn matmul_autotune(
         const PRIORITY_MEDIUM: i8 = 1;
         const PRIORITY_MIN: i8 = 0;
         const PRIORITY_NEVER: i8 = -1;
-
         let accelerated = TuneGroup::<MatmulAutotuneKey>::new("accelerated", |key| {
             if matches!(key.analysis.kind, MatmulKind::General) {
                 match key.analysis.scale_global {
@@ -154,7 +155,10 @@ pub fn matmul_autotune(
                 PRIORITY_HIGH
             };
 
-            if key.definition.lhs_stride_factor >= 4 && key.definition.rhs_stride_factor >= 4 {
+            if async_copy_strides_aligned(
+                key.definition.lhs_stride_factor,
+                key.definition.rhs_stride_factor,
+            ) {
                 priority_max
             } else {
                 PRIORITY_NEVER
@@ -550,6 +554,10 @@ pub fn matmul_autotune(
                 TileMatmulKind::Mma,
             ),
         ] {
+            // Specialized cyclic strategies use AsyncPartialCyclicLoading, whose setup validator
+            // requires both operands to meet the 16-byte async-copy stride alignment.
+            let needs_aligned_strides = strategy_requires_async_copy_alignment(&strategy);
+
             let mut tunable = Tunable::new(&strategy.to_string(), move |(lhs, rhs, out)| {
                 launch_matmul::<_>(&strategy, lhs, rhs, out).map_err(|err| format!("{err:?}"))
             });
@@ -561,6 +569,14 @@ pub fn matmul_autotune(
             let accelerated_priority = move |key: &MatmulAutotuneKey, client: &Client| {
                 if !tile_matmul_supported(client, tile_matmul, &key.definition) {
                     return PRIORITY_MIN;
+                }
+
+                if !async_copy_candidate_allowed(
+                    needs_aligned_strides,
+                    key.definition.lhs_stride_factor,
+                    key.definition.rhs_stride_factor,
+                ) {
+                    return PRIORITY_NEVER;
                 }
 
                 match double_buf {
@@ -622,4 +638,61 @@ fn create_key((lhs, rhs, out): &Inputs) -> MatmulAutotuneKey {
         lhs.try_scheme(),
         rhs.try_scheme(),
     )
+}
+
+fn async_copy_strides_aligned(lhs_stride_factor: u8, rhs_stride_factor: u8) -> bool {
+    lhs_stride_factor >= ASYNC_COPY_STRIDE_FACTOR && rhs_stride_factor >= ASYNC_COPY_STRIDE_FACTOR
+}
+
+fn strategy_requires_async_copy_alignment(strategy: &Strategy) -> bool {
+    matches!(
+        strategy,
+        Strategy::SpecializedCyclicCmma(_) | Strategy::SpecializedCyclicMma(_)
+    )
+}
+
+fn async_copy_candidate_allowed(
+    needs_aligned_strides: bool,
+    lhs_stride_factor: u8,
+    rhs_stride_factor: u8,
+) -> bool {
+    !needs_aligned_strides || async_copy_strides_aligned(lhs_stride_factor, rhs_stride_factor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn specialized_cyclic_strategies_require_async_copy_alignment() {
+        let specialized = Strategy::SpecializedCyclicCmma(BlueprintStrategy::Inferred(().into()));
+        let synchronous =
+            Strategy::DoubleCyclicCmma(BlueprintStrategy::Inferred(DoubleBufferingArgs {
+                specialized: false,
+                tile_matmul: TileMatmulKind::Cmma,
+            }));
+
+        assert!(strategy_requires_async_copy_alignment(&specialized));
+        assert!(async_copy_candidate_allowed(
+            strategy_requires_async_copy_alignment(&specialized),
+            4,
+            4
+        ));
+        assert!(!async_copy_candidate_allowed(
+            strategy_requires_async_copy_alignment(&specialized),
+            4,
+            3
+        ));
+        assert!(!async_copy_candidate_allowed(
+            strategy_requires_async_copy_alignment(&specialized),
+            3,
+            4
+        ));
+        assert!(!strategy_requires_async_copy_alignment(&synchronous));
+        assert!(async_copy_candidate_allowed(
+            strategy_requires_async_copy_alignment(&synchronous),
+            3,
+            3
+        ));
+    }
 }
